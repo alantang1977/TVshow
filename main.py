@@ -465,6 +465,28 @@ def generate_m3u(sorted_channels, output_path):
     logger.info(f"M3U文件生成完成: {output_path}, 共 {len(sorted_channels)} 个频道")
     return output_path
 
+def generate_txt(sorted_channels, output_path):
+    """生成标准TXT格式直播源文件，格式为"频道名称,主源URL,备用源URL(可选)" """
+    logger.info(f"开始生成TXT文件: {output_path}")
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        # 写入说明行
+        f.write("# 标准IPTV直播源TXT格式：频道名称,主源URL,备用源URL(可选)\n")
+        
+        # 写入频道信息
+        for channel_name, data in sorted_channels:
+            sources = data["sources"]
+            # 构建TXT行，使用逗号分隔
+            line_parts = [channel_name, sources[0]]
+            # 添加备用源（如果有）
+            if len(sources) > 1:
+                line_parts.append(sources[1])
+            # 写入行
+            f.write(f"{','.join(line_parts)}\n")
+    
+    logger.info(f"TXT文件生成完成: {output_path}, 共 {len(sorted_channels)} 个频道")
+    return output_path
+
 def build_extinf(info):
     """构建EXTINF行"""
     attrs = []
@@ -556,26 +578,37 @@ def main():
                 epg_data = download_and_parse_epg(config)
                 
                 # 匹配频道与EPG
-                serializable_results = match_channels_with_epg(serializable_results, epg_data, config)
+                check_results = match_channels_with_epg(check_results, epg_data, config)
             
             # 整理频道
-            channels_by_name = organize_channels(serializable_results, config)
-            
-            # 按分类排序频道
-            sorted_channels = sort_channels_by_category(channels_by_name, config)
-            
-            # 生成最终M3U文件
-            output_file = config.get("output_file", "iptv_collection.m3u")
-            output_path = os.path.join(output_dir, output_file)
-            generate_m3u(sorted_channels, output_path)
+            organized_channels = organize_channels(check_results, config)
         else:
-            logger.info("跳过直播源检测步骤")
+            # 不进行检查时的处理
+            simplified_results = {}
+            for channel_id, (info, urls) in all_channels.items():
+                simplified_results[channel_id] = {
+                    "info": info,
+                    "sources": [{"url": url, "valid": True, "latency": 0} for url in urls]
+                }
+            organized_channels = organize_channels(simplified_results, config)
+        
+        # 按分类排序频道
+        sorted_channels = sort_channels_by_category(organized_channels, config)
+        
+        # 生成M3U文件
+        m3u_output_path = os.path.join(output_dir, config["output_file"])
+        generate_m3u(sorted_channels, m3u_output_path)
+        
+        # 生成TXT文件（使用与M3U相同的文件名，仅更改扩展名）
+        txt_filename = os.path.splitext(config["output_file"])[0] + ".txt"
+        txt_output_path = os.path.join(output_dir, txt_filename)
+        generate_txt(sorted_channels, txt_output_path)
         
         end_time = time.time()
-        logger.info(f"IPTV直播源处理完成，总耗时: {end_time - start_time:.2f}秒")
+        logger.info(f"IPTV直播源处理流程完成，总耗时: {end_time - start_time:.2f}秒")
         
     except Exception as e:
-        logger.error(f"程序运行出错: {str(e)}", exc_info=True)
+        logger.error(f"处理过程出错: {str(e)}", exc_info=True)
         sys.exit(1)
 
 if __name__ == "__main__":
