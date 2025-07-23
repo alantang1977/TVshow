@@ -5,6 +5,7 @@ import os
 import logging
 import requests
 import time
+import random
 import re
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
@@ -54,17 +55,46 @@ class IPTVSourceCollector:
             # 下载源文件
             logger.info(f"下载源: {source_url}")
             
+            # 增强的请求头，模拟真实浏览器
             headers = {
-                "User-Agent": self.config.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"),
-                "Accept": "*/*"
+                "User-Agent": self.config.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+                "Cache-Control": "max-age=0",
+                "Referer": "https://www.google.com/",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "cross-site",
+                "Sec-Fetch-User": "?1"
             }
+            
+            # 添加随机延迟避免被识别为机器人
+            time.sleep(random.uniform(1, 3))
             
             response = requests.get(
                 source_url,
                 headers=headers,
                 timeout=30,
-                allow_redirects=True
+                allow_redirects=True,
+                verify=True
             )
+            
+            # 处理403错误，尝试备用请求头
+            if response.status_code == 403:
+                logger.warning(f"访问被拒绝，尝试使用备用请求头: {source_url}")
+                # 尝试不同的浏览器UA
+                headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15"
+                headers["Referer"] = "https://github.com/"
+                time.sleep(random.uniform(2, 4))  # 更长的延迟
+                response = requests.get(
+                    source_url,
+                    headers=headers,
+                    timeout=30,
+                    allow_redirects=True
+                )
             
             if response.status_code == 200:
                 content = response.text
