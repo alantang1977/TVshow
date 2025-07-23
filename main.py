@@ -519,8 +519,8 @@ def main():
         config = load_config()
         logger.info(f"配置加载完成，共 {len(config.get('sources', []))} 个直播源")
         
-        # 创建输出目录
-        output_dir = os.path.join(os.path.dirname(__file__), config.get("output_dir", "output"))
+        # 创建输出目录（使用配置中的output_dir，不拼接脚本目录）
+        output_dir = config.get("output_dir", "output")
         os.makedirs(output_dir, exist_ok=True)
         
         # 收集直播源
@@ -547,68 +547,52 @@ def main():
         
         # 去重URL
         for channel_id, (info, urls) in all_channels.items():
-            all_channels[channel_id][1] = list(set(urls))
+            unique_urls = list({url.strip() for url in urls if url.strip()})
+            all_channels[channel_id][1] = unique_urls
         
-        logger.info(f"共解析出 {len(all_channels)} 个频道, {sum(len(urls) for _, urls in all_channels.values())} 个直播源")
+        logger.info(f"去重后共 {len(all_channels)} 个频道，准备进行处理")
         
-        # 检查直播源
+        # 转换为检测所需的格式
+        sources_data = {}
+        for channel_id, (info, urls) in all_channels.items():
+            sources_data[channel_id] = {
+                "info": info,
+                "sources": [{"url": url, "valid": True, "latency": 9999} for url in urls]
+            }
+        
+        # 检测直播源（如果未禁用）
         if not args.no_check:
             checker = IPTVSourceChecker(config)
-            check_results = checker.check(all_channels)
-            
-            # 保存结果为JSON文件（仅用于调试或API访问）
-            json_output_path = os.path.join(output_dir, "collected_sources.json")
-            
-            # 转换结果为可序列化的格式
-            serializable_results = {}
-            for channel_id, result in check_results.items():
-                serializable_results[channel_id] = {
-                    "info": result["info"],
-                    "sources": [
-                        {"url": url, "valid": valid, "latency": latency if latency != float('inf') else -1}
-                        for url, valid, latency in result["sources"]
-                    ]
-                }
-            
-            with open(json_output_path, 'w', encoding='utf-8') as f:
-                json.dump(serializable_results, f, ensure_ascii=False, indent=2)
-                
-            logger.info(f"JSON格式检测结果已保存到: {json_output_path}")
-            
-            # 下载和解析EPG数据
-            epg_data = {}
-            if not args.no_epg:
-                epg_data = download_and_parse_epg(config)
-                
-                # 匹配频道与EPG
-                check_results = match_channels_with_epg(check_results, epg_data, config)
-            
-            # 整理频道
-            organized_channels = organize_channels(check_results, config)
-        else:
-            # 不进行检查时的处理
-            simplified_results = {}
-            for channel_id, (info, urls) in all_channels.items():
-                simplified_results[channel_id] = {
-                    "info": info,
-                    "sources": [{"url": url, "valid": True, "latency": 0} for url in urls]
-                }
-            organized_channels = organize_channels(simplified_results, config)
+            sources_data = checker.check(sources_data)
+        
+        # 处理EPG数据（如果未禁用）
+        epg_data = {}
+        if not args.no_epg:
+            epg_data = download_and_parse_epg(config)
+        
+        # 匹配频道与EPG
+        sources_data = match_channels_with_epg(sources_data, epg_data, config)
+        
+        # 整理频道
+        organized_channels = organize_channels(sources_data, config)
         
         # 按分类排序频道
         sorted_channels = sort_channels_by_category(organized_channels, config)
         
+        # 生成输出文件路径（基于配置的output_file）
+        base_filename = os.path.splitext(config.get("output_file", "iptv.m3u"))[0]
+        m3u_path = os.path.join(output_dir, f"{base_filename}.m3u")
+        txt_path = os.path.join(output_dir, f"{base_filename}.txt")
+        
         # 生成M3U文件
-        m3u_output_path = os.path.join(output_dir, config.get("output_file", "iptv.m3u"))
-        generate_m3u(sorted_channels, m3u_output_path)
+        generate_m3u(sorted_channels, m3u_path)
         
-        # 生成TXT文件（使用与M3U相同的文件名，仅更改扩展名）
-        txt_filename = os.path.splitext(config.get("output_file", "iptv.m3u"))[0] + ".txt"
-        txt_output_path = os.path.join(output_dir, txt_filename)
-        generate_txt(sorted_channels, txt_output_path)
+        # 生成TXT文件
+        generate_txt(sorted_channels, txt_path)
         
+        # 计算总耗时
         end_time = time.time()
-        logger.info(f"IPTV直播源处理流程完成，总耗时: {end_time - start_time:.2f}秒")
+        logger.info(f"所有处理完成，总耗时: {end_time - start_time:.2f}秒")
         
     except Exception as e:
         logger.error(f"处理过程出错: {str(e)}", exc_info=True)
@@ -616,4 +600,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
