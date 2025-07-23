@@ -12,9 +12,9 @@ import gzip
 import xml.etree.ElementTree as ET
 import re
 from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor
-from collector import IPTVSourceCollector
-from checker import IPTVSourceChecker
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # 配置日志
 logging.basicConfig(
@@ -26,6 +26,53 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("IPTV-Main")
+
+# GitHub环境检测
+IS_GITHUB_ENV = os.environ.get('GITHUB_ACTIONS', 'false').lower() == 'true'
+
+def create_session_with_retries():
+    """创建带有重试机制的会话，特别优化GitHub环境"""
+    session = requests.Session()
+    
+    # 定义重试策略，针对GitHub优化
+    retry_strategy = Retry(
+        total=5,  # 增加重试次数
+        backoff_factor=1,  # 指数退避因子
+        status_forcelist=[403, 429, 500, 502, 503, 504],
+        allowed_methods=["HEAD", "GET", "OPTIONS"]
+    )
+    
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    
+    # 设置基础请求头，模拟浏览器
+    base_headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.8,en-US;q=0.5,en;q=0.3',
+        'Connection': 'keep-alive',
+        'DNT': '1',  # 不跟踪请求
+        'Upgrade-Insecure-Requests': '1'
+    }
+    
+    # GitHub特定请求头优化
+    if IS_GITHUB_ENV:
+        base_headers['User-Agent'] = 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0'
+        base_headers['Referer'] = 'https://github.com/'
+    else:
+        base_headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+    
+    session.headers.update(base_headers)
+    return session
+
+# 准备多个用户代理，用于轮换
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/115.0',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36'
+]
 
 def load_config():
     """加载配置文件"""
@@ -40,6 +87,61 @@ def load_config():
         logger.error(f"加载配置文件失败: {str(e)}")
         sys.exit(1)
 
+def download_source_with_retry(url, session=None, max_attempts=3):
+    """下载源文件并处理403等错误，支持多轮重试和用户代理轮换"""
+    session = session or create_session_with_retries()
+    attempt = 0
+    
+    while attempt < max_attempts:
+        try:
+            # 每轮尝试使用不同的用户代理
+            session.headers['User-Agent'] = USER_AGENTS[attempt % len(USER_AGENTS)]
+            
+            # 对GitHub源添加特殊处理
+            parsed_url = urlparse(url)
+            if 'github.com' in parsed_url.netloc:
+                # GitHub Raw内容需要特殊Accept头
+                session.headers['Accept'] = 'application/vnd.github.raw+json, text/plain, */*'
+                # 添加GitHub API友好的请求间隔
+                if attempt > 0:
+                    time.sleep(1.5)  # GitHub对频繁请求限制较严
+            else:
+                session.headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+            
+            response = session.get(url, timeout=30, stream=True)
+            
+            # 处理403响应的特殊情况
+            if response.status_code == 403:
+                logger.warning(f"尝试 {attempt+1}/{max_attempts} 访问 {url} 被拒绝，更换策略重试")
+                
+                # 对于GitHub，尝试添加Authorization头（如果有环境变量）
+                if 'github.com' in parsed_url.netloc and os.environ.get('GITHUB_TOKEN'):
+                    session.headers['Authorization'] = f'token {os.environ.get("GITHUB_TOKEN")}'
+                else:
+                    # 清除可能引起问题的头信息
+                    session.headers.pop('Authorization', None)
+                
+                attempt += 1
+                continue
+                
+            if response.status_code == 200:
+                # 对于大文件，使用流式读取
+                content = []
+                for chunk in response.iter_content(chunk_size=8192):
+                    content.append(chunk)
+                return b''.join(content).decode('utf-8', errors='ignore')
+                
+            logger.error(f"下载源失败: {url}, 状态码: {response.status_code}")
+            return None
+            
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"尝试 {attempt+1}/{max_attempts} 下载 {url} 失败: {str(e)}, 重试中...")
+            attempt += 1
+            time.sleep(1 * attempt)  # 指数退避
+        
+    logger.error(f"超过最大重试次数，无法下载 {url}")
+    return None
+
 def parse_m3u_file(filepath):
     """解析M3U文件，提取频道信息和URL"""
     logger.info(f"解析M3U文件: {filepath}")
@@ -51,11 +153,15 @@ def parse_m3u_file(filepath):
         logger.error(f"读取文件失败: {filepath}, 错误: {str(e)}")
         return {}
     
+    return parse_m3u_content(content, filepath)
+
+def parse_m3u_content(content, source):
+    """解析M3U内容字符串"""
     channels = {}
     
     lines = content.strip().split('\n')
     if not lines or not lines[0].startswith('#EXTM3U'):
-        logger.warning(f"不是有效的M3U文件: {filepath}")
+        logger.warning(f"不是有效的M3U内容: {source}")
         return channels
     
     i = 1
@@ -97,7 +203,7 @@ def parse_m3u_file(filepath):
         else:
             i += 1
     
-    logger.info(f"从文件 {filepath} 解析出 {len(channels)} 个频道")
+    logger.info(f"从 {source} 解析出 {len(channels)} 个频道")
     return channels
 
 def parse_extinf(extinf_line):
@@ -130,26 +236,26 @@ def download_and_parse_epg(config):
         return {}
         
     logger.info("开始下载和解析EPG数据")
-    
+    session = create_session_with_retries()
     epg_data = {}  # 格式: {频道ID: {"id": id, "name": name, "icon": icon_url}}
     
     for epg_url in config["epg_urls"]:
         logger.info(f"下载EPG: {epg_url}")
         try:
-            response = requests.get(epg_url, timeout=120)
-            if response.status_code != 200:
-                logger.error(f"下载EPG失败，状态码: {response.status_code}")
+            content = download_source_with_retry(epg_url, session)
+            if not content:
                 continue
                 
-            # 检查是否为gzip格式
+            # 处理二进制内容（如果是gzip）
             if epg_url.endswith('.gz'):
                 try:
-                    content = gzip.decompress(response.content)
+                    # 尝试将文本内容转换为字节流进行解压
+                    content = gzip.decompress(content.encode('utf-8', errors='ignore'))
                 except Exception as e:
                     logger.error(f"解压EPG数据失败: {str(e)}")
                     continue
             else:
-                content = response.content
+                content = content.encode('utf-8', errors='ignore')
                 
             # 解析XML
             try:
@@ -336,8 +442,14 @@ def organize_channels(sources_data, config):
         if not valid_sources:
             continue
             
-        # 按延迟排序
-        valid_sources.sort(key=lambda x: x[1])
+        # 按延迟排序，优先选择CDN源
+        def source_priority(source):
+            url, latency = source
+            cdn_keywords = ["cdn", "akamai", "cloudflare", "aliyun", "tencent", "github"]
+            has_cdn = any(kw in url.lower() for kw in cdn_keywords)
+            return latency if not has_cdn else latency * 0.5
+            
+        valid_sources.sort(key=source_priority)
         
         # 保留最多两个源（速度最快和第二快的）
         best_sources = valid_sources[:min(2, len(valid_sources))]
@@ -439,7 +551,7 @@ def extract_cctv_number(channel_name):
     return 999  # 非数字频道排在后面
 
 def generate_m3u(sorted_channels, output_path):
-    """生成标准M3U文件，使用group-title标记分类，格式如：#EXTINF:-1 group-title="央视频道",CCTV1"""
+    """生成标准M3U文件，使用group-title标记分类"""
     logger.info(f"开始生成M3U文件: {output_path}")
     
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -454,8 +566,8 @@ def generate_m3u(sorted_channels, output_path):
             # 获取分类信息
             category = info.get('group-title', '其他频道')
             
-            # 构建简化的EXTINF行，只包含group-title和频道名称
-            extinf = f'#EXTINF:-1 group-title="{category}",{channel_name}'
+            # 构建EXTINF行
+            extinf = f'#EXTINF:-1 group-title="{category}" tvg-id="{info.get("tvg-id","")}" tvg-logo="{info.get("tvg-logo","")}",{channel_name}'
             f.write(f"{extinf}\n")
             
             # 写入主源
@@ -469,7 +581,7 @@ def generate_m3u(sorted_channels, output_path):
     return output_path
 
 def generate_txt(sorted_channels, output_path):
-    """生成标准TXT格式直播源文件，使用"分类名称,#genre#"作为分类标记"""
+    """生成标准TXT格式直播源文件"""
     logger.info(f"开始生成TXT文件: {output_path}")
     
     with open(output_path, 'w', encoding='utf-8') as f:
@@ -503,6 +615,133 @@ def generate_txt(sorted_channels, output_path):
     logger.info(f"TXT文件生成完成: {output_path}, 共 {len(sorted_channels)} 个频道")
     return output_path
 
+def check_source(url, session=None):
+    """检查直播源是否有效并返回延迟"""
+    session = session or create_session_with_retries()
+    start_time = time.time()
+    
+    try:
+        # 对不同类型的URL使用不同的检测方法
+        if url.endswith(('.m3u', '.m3u8')):
+            # 对于播放列表，只需检查是否能下载
+            response = session.get(url, timeout=10, stream=True)
+            return {
+                "url": url,
+                "valid": response.status_code == 200,
+                "latency": (time.time() - start_time) * 1000
+            }
+        else:
+            # 对于直接的流链接，尝试读取少量数据
+            response = session.get(url, timeout=10, stream=True)
+            if response.status_code != 200:
+                return {"url": url, "valid": False, "latency": 9999}
+                
+            # 读取前10KB验证是否为视频流
+            content = b""
+            for chunk in response.iter_content(chunk_size=1024):
+                if chunk:
+                    content += chunk
+                    if len(content) >= 10240:  # 读取10KB
+                        break
+            
+            # 简单验证视频流特征
+            video_signatures = [b'video/', b'mpeg', b'h264', b'h265', b'flv', b'ts']
+            is_valid = any(sig in content.lower() for sig in video_signatures)
+            
+            return {
+                "url": url,
+                "valid": is_valid,
+                "latency": (time.time() - start_time) * 1000
+            }
+            
+    except Exception as e:
+        logger.debug(f"源 {url} 检测失败: {str(e)}")
+        return {
+            "url": url,
+            "valid": False,
+            "latency": 9999
+        }
+
+class IPTVSourceChecker:
+    """直播源检查器"""
+    def __init__(self, config):
+        self.config = config
+        self.max_workers = config.get('check_workers', 10)  # 并发检查数量
+        self.session = create_session_with_retries()
+        
+    def check(self, sources_data):
+        """检查所有源的有效性"""
+        logger.info(f"开始检查直播源有效性，共 {len(sources_data)} 个频道")
+        
+        for channel_id, data in sources_data.items():
+            urls = [source["url"] for source in data["sources"]]
+            
+            # 使用线程池并发检查
+            results = []
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {executor.submit(check_source, url, self.session): url for url in urls}
+                
+                for future in as_completed(futures):
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception as e:
+                        url = futures[future]
+                        logger.error(f"检查源 {url} 时发生错误: {str(e)}")
+                        results.append({"url": url, "valid": False, "latency": 9999})
+            
+            # 更新源信息
+            data["sources"] = results
+            
+        logger.info("直播源检查完成")
+        return sources_data
+
+class IPTVSourceCollector:
+    """直播源收集器"""
+    def __init__(self, config):
+        self.config = config
+        self.session = create_session_with_retries()
+        self.temp_dir = config.get('temp_dir', 'temp_sources')
+        os.makedirs(self.temp_dir, exist_ok=True)
+        
+    def collect(self):
+        """收集所有配置的源"""
+        sources = self.config.get('sources', [])
+        if not sources:
+            logger.warning("未配置任何直播源")
+            return []
+            
+        logger.info(f"开始收集 {len(sources)} 个直播源")
+        collected_files = []
+        
+        # 处理本地文件和URL
+        for source in sources:
+            if source.startswith(('http://', 'https://')):
+                # 处理URL源
+                logger.info(f"正在收集URL源: {source}")
+                content = download_source_with_retry(source, self.session)
+                
+                if content:
+                    # 保存到临时文件
+                    filename = f"source_{hash(source)}.m3u"
+                    filepath = os.path.join(self.temp_dir, filename)
+                    
+                    with open(filepath, 'w', encoding='utf-8', errors='ignore') as f:
+                        f.write(content)
+                        
+                    collected_files.append(filepath)
+                else:
+                    logger.error(f"无法收集URL源: {source}")
+            else:
+                # 处理本地文件
+                if os.path.exists(source):
+                    logger.info(f"添加本地源文件: {source}")
+                    collected_files.append(source)
+                else:
+                    logger.warning(f"本地源文件不存在: {source}")
+        
+        return collected_files
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='IPTV直播源收集、检测与整理工具')
@@ -512,14 +751,14 @@ def main():
     args = parser.parse_args()
     
     start_time = time.time()
-    logger.info("开始IPTV直播源处理流程")
+    logger.info(f"开始IPTV直播源处理流程 {'(GitHub环境)' if IS_GITHUB_ENV else ''}")
     
     try:
         # 加载配置
         config = load_config()
         logger.info(f"配置加载完成，共 {len(config.get('sources', []))} 个直播源")
         
-        # 创建输出目录（使用配置中的output_dir，不拼接脚本目录）
+        # 创建输出目录
         output_dir = config.get("output_dir", "output")
         os.makedirs(output_dir, exist_ok=True)
         
@@ -579,7 +818,7 @@ def main():
         # 按分类排序频道
         sorted_channels = sort_channels_by_category(organized_channels, config)
         
-        # 生成输出文件路径（基于配置的output_file）
+        # 生成输出文件路径
         base_filename = os.path.splitext(config.get("output_file", "iptv.m3u"))[0]
         m3u_path = os.path.join(output_dir, f"{base_filename}.m3u")
         txt_path = os.path.join(output_dir, f"{base_filename}.txt")
