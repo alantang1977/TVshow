@@ -23,7 +23,9 @@ class IPTVSourceChecker:
         # 准备检查任务
         check_tasks = []
         for channel_id, (info, urls) in channels.items():
-            for url in urls:
+            # 去重URL
+            unique_urls = list(set(urls))
+            for url in unique_urls:
                 check_tasks.append((channel_id, info, url))
         
         logger.info(f"共 {len(check_tasks)} 个直播源需要检查")
@@ -42,7 +44,7 @@ class IPTVSourceChecker:
                         # 存储结果
                         if channel_id not in self.results:
                             self.results[channel_id] = {
-                                "info": info,
+                                "info": info.copy(),
                                 "sources": []
                             }
                         
@@ -54,7 +56,7 @@ class IPTVSourceChecker:
                         # 添加失败记录
                         if channel_id not in self.results:
                             self.results[channel_id] = {
-                                "info": info,
+                                "info": info.copy(),
                                 "sources": []
                             }
                         self.results[channel_id]["sources"].append((url, False, float('inf')))
