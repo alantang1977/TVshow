@@ -6,6 +6,7 @@ import sys
 import json
 import logging
 import time
+import random
 import argparse
 import requests
 import gzip
@@ -133,10 +134,35 @@ def download_and_parse_epg(config):
     
     epg_data = {}  # 格式: {频道ID: {"id": id, "name": name, "icon": icon_url}}
     
+    # EPG下载专用请求头
+    epg_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+        "Accept": "application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Referer": "https://github.com/",
+    }
+    
     for epg_url in config["epg_urls"]:
         logger.info(f"下载EPG: {epg_url}")
         try:
-            response = requests.get(epg_url, timeout=120)
+            # 随机延迟
+            time.sleep(random.uniform(1, 3))
+            
+            response = requests.get(
+                epg_url, 
+                headers=epg_headers,
+                timeout=120,
+                allow_redirects=True
+            )
+            
+            if response.status_code == 403:
+                logger.warning(f"EPG访问被拒绝，尝试备用请求头: {epg_url}")
+                epg_headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15"
+                time.sleep(random.uniform(2, 4))
+                response = requests.get(epg_url, headers=epg_headers, timeout=120)
+                
             if response.status_code != 200:
                 logger.error(f"下载EPG失败，状态码: {response.status_code}")
                 continue
@@ -553,62 +579,55 @@ def main():
             checker = IPTVSourceChecker(config)
             check_results = checker.check(all_channels)
             
-            # 保存结果为JSON文件（仅用于调试或API访问）
-            json_output_path = os.path.join(output_dir, "collected_sources.json")
-            
-            # 转换结果为可序列化的格式
-            serializable_results = {}
-            for channel_id, result in check_results.items():
-                serializable_results[channel_id] = {
-                    "info": result["info"],
-                    "sources": [
-                        {"url": url, "valid": valid, "latency": latency if latency != float('inf') else -1}
-                        for url, valid, latency in result["sources"]
-                    ]
+            # 转换结果格式
+            processed_results = {}
+            for channel_id, data in check_results.items():
+                processed_results[channel_id] = {
+                    "info": data["info"],
+                    "sources": [{"url": url, "valid": valid, "latency": latency} 
+                               for url, valid, latency in data["sources"]]
                 }
-            
-            with open(json_output_path, 'w', encoding='utf-8') as f:
-                json.dump(serializable_results, f, ensure_ascii=False, indent=2)
-                
-            logger.info(f"JSON格式检测结果已保存到: {json_output_path}")
-            
-            # 下载和解析EPG数据
-            epg_data = {}
-            if not args.no_epg:
-                epg_data = download_and_parse_epg(config)
-                
-                # 匹配频道与EPG
-                check_results = match_channels_with_epg(check_results, epg_data, config)
-            
-            # 整理频道
-            organized_channels = organize_channels(check_results, config)
         else:
-            # 不进行检查时的处理
-            simplified_results = {}
+            # 跳过检查时，默认所有源都有效
+            processed_results = {}
             for channel_id, (info, urls) in all_channels.items():
-                simplified_results[channel_id] = {
+                processed_results[channel_id] = {
                     "info": info,
                     "sources": [{"url": url, "valid": True, "latency": 0} for url in urls]
                 }
-            organized_channels = organize_channels(simplified_results, config)
         
-        # 按分类排序频道
+        # 处理EPG数据
+        epg_data = {}
+        if not args.no_epg:
+            epg_data = download_and_parse_epg(config)
+        
+        # 匹配频道与EPG
+        matched_channels = match_channels_with_epg(processed_results, epg_data, config)
+        
+        # 整理频道
+        organized_channels = organize_channels(matched_channels, config)
+        
+        # 按分类排序
         sorted_channels = sort_channels_by_category(organized_channels, config)
         
-        # 生成M3U文件
-        m3u_output_path = os.path.join(output_dir, config["output_file"])
-        generate_m3u(sorted_channels, m3u_output_path)
+        # 生成输出文件
+        output_file = config["output_file"]
+        output_path = os.path.join(output_dir, output_file)
         
-        # 生成TXT文件（使用与M3U相同的文件名，仅更改扩展名）
-        txt_filename = os.path.splitext(config["output_file"])[0] + ".txt"
-        txt_output_path = os.path.join(output_dir, txt_filename)
+        # 生成M3U文件
+        generate_m3u(sorted_channels, output_path)
+        
+        # 生成TXT文件
+        txt_output_path = os.path.splitext(output_path)[0] + ".txt"
         generate_txt(sorted_channels, txt_output_path)
         
+        # 计算总耗时
         end_time = time.time()
-        logger.info(f"IPTV直播源处理流程完成，总耗时: {end_time - start_time:.2f}秒")
+        total_time = end_time - start_time
+        logger.info(f"IPTV直播源处理流程完成，总耗时: {total_time:.2f}秒")
         
     except Exception as e:
-        logger.error(f"处理过程出错: {str(e)}", exc_info=True)
+        logger.error(f"处理过程中发生错误: {str(e)}", exc_info=True)
         sys.exit(1)
 
 if __name__ == "__main__":
