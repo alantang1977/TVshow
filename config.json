@@ -1,7 +1,7 @@
 {
   "sources": [
     "https://iptv-org.github.io/iptv/index.m3u",
-    "https://tv.iill.top/m3u/Gather",
+    #"https://tv.iill.top/m3u/Gather",
     "https://raw.githubusercontent.com/YanG-1989/m3u/main/Gather.m3u",
     "https://tv.iill.top/m3u/Live",
     "https://tv.iill.top/m3u/MyTV",
