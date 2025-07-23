@@ -5,6 +5,7 @@ import os
 import logging
 import requests
 import time
+import re
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 
@@ -54,7 +55,7 @@ class IPTVSourceCollector:
             logger.info(f"下载源: {source_url}")
             
             headers = {
-                "User-Agent": self.config.get("user_agent", "Mozilla/5.0"),
+                "User-Agent": self.config.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"),
                 "Accept": "*/*"
             }
             
@@ -112,7 +113,6 @@ class IPTVSourceCollector:
         safe_filename = f"{domain}_{timestamp}_{filename}"
         
         # 确保文件名安全
-        import re
         safe_filename = re.sub(r'[^\w.-]', '_', safe_filename)
         
         return safe_filename
@@ -123,7 +123,6 @@ class IPTVSourceCollector:
             return False
             
         # 简单检查是否包含URL模式
-        import re
         lines = content.strip().split('\n')
         
         # 检查至少有一行符合常见直播源URL模式
@@ -147,7 +146,6 @@ class IPTVSourceCollector:
                 continue
                 
             # 检查是否为URL
-            import re
             if re.match(r'https?://|rtmp://|rtsp://', line):
                 m3u_content += f"#EXTINF:-1,Unknown Channel\n{line}\n"
             elif ',' in line:
