@@ -17,17 +17,35 @@ class IPTVSourceCollector:
         self.sources_dir = os.path.join(os.path.dirname(__file__), "data", "sources")
         os.makedirs(self.sources_dir, exist_ok=True)
         
+        # 加载无效源缓存
+        self.invalid_sources = self._load_invalid_sources()
+        
+    def _load_invalid_sources(self):
+        """加载无效源缓存"""
+        cache_path = os.path.join(os.path.dirname(__file__), "data", "invalid_sources_cache.json")
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"加载无效源缓存失败: {str(e)}")
+        return []
+    
     def collect(self):
         """收集所有配置的直播源"""
         logger.info("开始收集直播源...")
         
         collected_files = []
         
+        # 过滤掉缓存中的无效源URL
+        valid_sources = [url for url in self.config["sources"] if url not in self.invalid_sources]
+        logger.info(f"过滤后待收集的源URL: {len(valid_sources)}/{len(self.config['sources'])}")
+        
         # 使用线程池并发下载
         with ThreadPoolExecutor(max_workers=8) as executor:
             futures = {}
             
-            for source_url in self.config["sources"]:
+            for source_url in valid_sources:
                 future = executor.submit(self._download_source, source_url)
                 futures[future] = source_url
             
@@ -55,11 +73,22 @@ class IPTVSourceCollector:
             logger.info(f"下载源: {source_url}")
             
             headers = {
-                "User-Agent": self.config.get("user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"),
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
                 "Accept": "*/*"
             }
             
-            response = requests.get(
+            # 创建带有重试机制的会话（重试2次）
+            session = requests.Session()
+            retry_strategy = Retry(
+                total=2,  # 重试次数改为2次
+                backoff_factor=1,
+                status_forcelist=[403, 429, 500, 502, 503, 504]
+            )
+            adapter = requests.adapters.HTTPAdapter(max_retries=retry_strategy)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            
+            response = session.get(
                 source_url,
                 headers=headers,
                 timeout=30,
