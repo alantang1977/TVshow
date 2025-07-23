@@ -295,196 +295,288 @@ def should_exclude_channel(info, url, config):
                 return True
     
     # 检查频道ID是否为数字
+    # 有些源使用纯数字作为频道ID，可能会导致乱码或其他问题
     tvg_id = info.get('tvg-id', '')
-    if tvg_id and tvg_id.isdigit() and len(tvg_id) > 6:
+    if tvg_id and tvg_id.isdigit() and len(tvg_id) < 5:  # 排除类似"4"这样的频道ID
         return True
         
-    # 检查频道名称是否包含敏感词
-    if "excluded_keywords" in config:
-        title = info.get('title', '').lower()
-        for keyword in config["excluded_keywords"]:
-            if keyword.lower() in title:
-                return True
-                
+    # 检查组标题是否包含乱码
+    group_title = info.get('group-title', '')
+    if any(char in group_title for char in ['å', 'é¢', 'è§', 'é', '¢', '§', 'è', 'æ', 'ç', '¾', 'â']):
+        return True
+    
     return False
 
-def categorize_channel(channel_title, config):
-    """对频道进行分类"""
-    categories = config.get("categories", [])
-    title_lower = channel_title.lower()
+def organize_channels(sources_data, config):
+    """整理频道，去除重复，为每个频道保留最多两个源"""
+    logger.info("开始整理频道...")
     
-    # 优先匹配央视
-    if re.match(r'cctv-?\d+', title_lower):
-        return "央视"
+    # 按频道名称分组
+    channels_by_name = {}
     
-    # 匹配其他分类
-    category_mappings = {
-        "卫视": ["卫视", "东方", "江苏", "湖南", "浙江", "北京", "山东", "广东", "深圳"],
-        "地方": ["地方", "市", "县", "区", "省"],
-        "港澳台": ["香港", "澳门", "台湾", "翡翠", "明珠", "凤凰", "中天", "东森", "tvbs", "本港台"],
-        "国际": ["国际", "bbc", "cnn", "nhk", "discovery", "hbo"],
-        "体育": ["体育", "cctv5", "赛事", "足球", "篮球", "奥运"],
-        "影视": ["电影", "电视剧", "影视", "剧场"],
-        "纪录": ["纪录", "documentary"],
-        "少儿": ["少儿", "卡通", "动画", "儿童"],
-        "音乐": ["音乐", "mtv", "audio"],
-        "新闻": ["新闻", "news"]
-    }
-    
-    for category, keywords in category_mappings.items():
-        if category in categories:
-            for keyword in keywords:
-                if keyword.lower() in title_lower:
-                    return category
-    
-    # 默认分类
-    return "其他" if "其他" in categories else categories[0]
-
-def sort_channels_in_category(category, channels):
-    """按规则对分类内的频道进行排序"""
-    # 央视按数字排序
-    if category == "央视":
-        def cctv_sort_key(channel):
-            title = channel["info"]["title"]
-            match = re.search(r'cctv-?(\d+)', title.lower())
-            if match:
-                return (0, int(match.group(1)))  # CCTV数字频道优先
-            return (1, title)  # 其他央视相关频道
-        return sorted(channels, key=cctv_sort_key)
-    
-    # 其他分类按名称拼音排序
-    try:
-        import pinyin
-        return sorted(channels, key=lambda x: pinyin.get(x["info"]["title"], format="strip", delimiter=""))
-    except ImportError:
-        # 没有pinyin库时按原文字排序
-        return sorted(channels, key=lambda x: x["info"]["title"])
-
-def generate_output_files(config, checked_data):
-    """生成分类排序后的M3U和TXT文件"""
-    output_dir = config["output_dir"]
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # 创建分类容器
-    categories = config.get("categories", [])
-    categorized = {cat: [] for cat in categories}
-    
-    # 过滤有效频道并分类
-    for channel_id, channel_data in checked_data.items():
-        # 筛选有效源并按延迟排序
-        valid_sources = [src for src in channel_data["sources"] if src[1]]
+    # 整理频道
+    for channel_id, data in sources_data.items():
+        info = data["info"]
+        title = info.get('title', '')
+        
+        # 跳过没有标题的频道
+        if not title:
+            continue
+            
+        # 收集有效源，并排除不需要的源
+        valid_sources = []
+        for source in data["sources"]:
+            if source["valid"] and not should_exclude_channel(info, source["url"], config):
+                valid_sources.append((source["url"], source["latency"]))
+        
+        # 如果没有有效源，跳过此频道
         if not valid_sources:
             continue
             
-        # 按延迟排序（升序）
-        valid_sources.sort(key=lambda x: x[2])
+        # 按延迟排序
+        valid_sources.sort(key=lambda x: x[1])
         
-        # 排除不需要的频道
-        if should_exclude_channel(channel_data["info"], valid_sources[0][0], config):
-            continue
-            
-        # 分类
-        category = categorize_channel(channel_data["info"]["title"], config)
-        if category not in categorized:
-            categorized[category] = []
-            
-        categorized[category].append({
-            "id": channel_id,
-            "info": channel_data["info"],
-            "sources": valid_sources
-        })
-    
-    # 生成合并的M3U文件
-    m3u_path = os.path.join(output_dir, config["output_file"])
-    with open(m3u_path, 'w', encoding='utf-8') as m3u_file:
-        m3u_file.write("#EXTM3U x-tvg-url=\"https://epg.51zmt.top:8000/e.xml.gz\"\n")
+        # 保留最多两个源（速度最快和第二快的）
+        best_sources = valid_sources[:min(2, len(valid_sources))]
         
-        # 按配置的分类顺序处理
-        for category in categories:
-            if not categorized[category]:
-                continue
-                
-            # 分类内排序
-            sorted_channels = sort_channels_in_category(category, categorized[category])
+        # 将频道添加到按名称分组的集合中
+        if title in channels_by_name:
+            existing_sources = channels_by_name[title]["sources"]
+            existing_latency = channels_by_name[title]["latency"]
             
-            # 写入分类标记（作为注释）
-            m3u_file.write(f"\n# 分类: {category}\n")
-            
-            # 写入频道
-            for channel in sorted_channels:
-                info = channel["info"]
-                extinf_parts = []
-                extinf_parts.append(f"tvg-id=\"{info.get('tvg-id', '')}\"")
-                if info.get('tvg-logo'):
-                    extinf_parts.append(f"tvg-logo=\"{info['tvg-logo']}\"")
-                extinf_line = f"#EXTINF:-1 {','.join(extinf_parts)},{info.get('title', '未知频道')}"
-                
-                # 写入主源
-                m3u_file.write(f"{extinf_line}\n")
-                m3u_file.write(f"{channel['sources'][0][0]}\n")
-                
-                # 写入备用源（带注释标记）
-                for url, _, latency in channel['sources'][1:]:
-                    m3u_file.write(f"# 备用源 (延迟: {latency:.2f}s): {url}\n")
+            # 如果现有的延迟更高（更慢），则替换为新的源
+            if best_sources[0][1] < existing_latency:
+                channels_by_name[title] = {
+                    "info": info,
+                    "sources": [source[0] for source in best_sources],
+                    "latency": best_sources[0][1]
+                }
+        else:
+            channels_by_name[title] = {
+                "info": info,
+                "sources": [source[0] for source in best_sources],
+                "latency": best_sources[0][1]
+            }
     
-    # 生成TXT文件（仅主源）
-    txt_path = os.path.join(output_dir, config["output_file"].replace('.m3u', '.txt'))
-    with open(txt_path, 'w', encoding='utf-8') as txt_file:
-        for category in categories:
-            if not categorized[category]:
-                continue
-                
-            # 分类内排序
-            sorted_channels = sort_channels_in_category(category, categorized[category])
-            
-            # 写入分类标题
-            txt_file.write(f"\n【{category}】\n")
-            
-            # 写入频道
-            for channel in sorted_channels:
-                title = channel["info"].get('title', '未知频道')
-                main_url = channel['sources'][0][0]
-                txt_file.write(f"{title},{main_url}\n")
+    logger.info(f"频道整理完成，共 {len(channels_by_name)} 个唯一频道")
+    return channels_by_name
+
+def sort_channels_by_category(channels, config):
+    """按分类对频道进行排序，仅对央视频道按数字从小到大排序，其他分类保持原有顺序"""
+    # 定义分类顺序
+    category_order = {cat: idx for idx, cat in enumerate(config.get("categories", []))}
+    default_order = len(category_order)
     
-    logger.info(f"已生成M3U文件: {m3u_path}")
-    logger.info(f"已生成TXT文件: {txt_path}")
+    # 分离央视和其他频道
+    cctv_channels = []
+    other_channels = []
+    
+    for channel_name, data in channels.items():
+        # 检查是否为央视频道
+        if re.match(r'^CCTV-\d+', channel_name):
+            # 提取频道数字
+            match = re.search(r'CCTV-(\d+)', channel_name)
+            if match:
+                cctv_num = int(match.group(1))
+                cctv_channels.append((channel_name, data, cctv_num))
+            else:
+                other_channels.append((channel_name, data))
+        else:
+            other_channels.append((channel_name, data))
+    
+    # 央视频道按数字从小到大排序
+    cctv_channels.sort(key=lambda x: x[2])
+    # 转换回原格式
+    sorted_cctv = [(name, data) for name, data, num in cctv_channels]
+    
+    # 其他频道按分类分组后保持原有顺序
+    categorized_others = {}
+    for name, data in other_channels:
+        group = data["info"].get("group-title", "其他")
+        if group not in categorized_others:
+            categorized_others[group] = []
+        categorized_others[group].append((name, data))
+    
+    # 按分类顺序组织其他频道
+    sorted_others = []
+    # 获取所有分类并按配置顺序排序
+    all_groups = set(categorized_others.keys())
+    # 按配置中的分类顺序处理
+    for cat in config.get("categories", []):
+        if cat in categorized_others:
+            sorted_others.extend(categorized_others[cat])
+            all_groups.remove(cat)
+    # 处理剩余分类
+    for group in all_groups:
+        sorted_others.extend(categorized_others[group])
+    
+    # 合并央视和其他频道
+    # 先按分类顺序处理，当遇到央视分类时插入排序好的央视，其他分类插入对应频道
+    final_sorted = []
+    cctv_group = "央视"  # 假设央视分类名为"央视"
+    cctv_added = False
+    
+    # 获取所有分类并按配置顺序排序
+    all_categories = []
+    for cat in config.get("categories", []):
+        if cat in categorized_others or (cat == cctv_group and cctv_channels):
+            all_categories.append(cat)
+    # 添加剩余分类
+    for group in all_groups:
+        if group not in all_categories:
+            all_categories.append(group)
+    
+    # 按分类顺序构建最终列表
+    for cat in all_categories:
+        if cat == cctv_group and not cctv_added:
+            # 添加排序好的央视频道
+            final_sorted.extend(sorted_cctv)
+            cctv_added = True
+        elif cat in categorized_others:
+            # 添加该分类下的其他频道
+            final_sorted.extend(categorized_others[cat])
+    
+    return final_sorted
+
+def generate_m3u(sorted_channels, output_path):
+    """生成M3U文件，包含主源和备用源"""
+    logger.info(f"开始生成M3U文件: {output_path}")
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        # 写入头部
+        f.write("#EXTM3U\n")
+        
+        # 写入频道信息
+        for channel_name, data in sorted_channels:
+            info = data["info"]
+            sources = data["sources"]
+            
+            # 构建EXTINF行
+            extinf = build_extinf(info)
+            f.write(f"{extinf}\n")
+            
+            # 写入主源
+            f.write(f"{sources[0]}\n")
+            
+            # 如果有备用源，添加备用源标记和URL
+            if len(sources) > 1:
+                f.write(f"#EXTBURL:{sources[1]}\n")
+    
+    logger.info(f"M3U文件生成完成: {output_path}, 共 {len(sorted_channels)} 个频道")
+    return output_path
+
+def build_extinf(info):
+    """构建EXTINF行"""
+    attrs = []
+    
+    for key, value in info.items():
+        if key != 'title':
+            attrs.append(f'{key}="{value}"')
+    
+    attrs_str = ' '.join(attrs)
+    title = info.get('title', '')
+    
+    return f"#EXTINF:-1 {attrs_str},{title}"
 
 def main():
     """主函数"""
-    config = load_config()
+    parser = argparse.ArgumentParser(description='IPTV直播源收集、检测与整理工具')
+    parser.add_argument('--no-check', action='store_true', help='跳过直播源检测步骤')
+    parser.add_argument('--no-epg', action='store_true', help='跳过EPG处理')
+    parser.add_argument('--max-channels', type=int, default=0, help='最大处理频道数量(用于测试)')
+    args = parser.parse_args()
     
-    # 1. 收集直播源
-    collector = IPTVSourceCollector(config)
-    collected_files = collector.collect()
-    if not collected_files:
-        logger.error("没有收集到任何直播源文件，程序退出")
-        return
+    start_time = time.time()
+    logger.info("开始IPTV直播源处理流程")
     
-    # 2. 解析所有收集到的文件
-    all_channels = {}
-    for file in collected_files:
-        channels = parse_m3u_file(file)
-        # 合并频道
-        for channel_id, (info, urls) in channels.items():
-            if channel_id in all_channels:
-                all_channels[channel_id][1].extend(urls)
-            else:
-                all_channels[channel_id] = [info, urls]
-    
-    logger.info(f"所有文件解析完成，共 {len(all_channels)} 个独特频道")
-    
-    # 3. 检测直播源有效性
-    checker = IPTVSourceChecker(config)
-    checked_data = checker.check(all_channels)
-    
-    # 4. 下载并匹配EPG数据
-    epg_data = download_and_parse_epg(config)
-    checked_data = match_channels_with_epg(checked_data, epg_data, config)
-    
-    # 5. 生成输出文件
-    generate_output_files(config, checked_data)
-    
-    logger.info("所有操作完成")
+    try:
+        # 加载配置
+        config = load_config()
+        logger.info(f"配置加载完成，共 {len(config['sources'])} 个直播源")
+        
+        # 创建输出目录
+        output_dir = os.path.join(os.path.dirname(__file__), config["output_dir"])
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 收集直播源
+        collector = IPTVSourceCollector(config)
+        source_files = collector.collect()
+        logger.info(f"直播源收集完成，共 {len(source_files)} 个文件")
+        
+        # 解析所有源文件
+        all_channels = {}
+        for filepath in source_files:
+            channels = parse_m3u_file(filepath)
+            
+            # 合并到全局频道集合
+            for channel_id, (info, urls) in channels.items():
+                if channel_id in all_channels:
+                    all_channels[channel_id][1].extend(urls)
+                else:
+                    all_channels[channel_id] = [info, urls]
+                    
+            # 如果设置了最大频道数限制，用于测试
+            if args.max_channels > 0 and len(all_channels) >= args.max_channels:
+                logger.info(f"达到最大频道数限制 ({args.max_channels})，停止收集")
+                break
+        
+        # 去重URL
+        for channel_id, (info, urls) in all_channels.items():
+            all_channels[channel_id][1] = list(set(urls))
+        
+        logger.info(f"共解析出 {len(all_channels)} 个频道, {sum(len(urls) for _, urls in all_channels.values())} 个直播源")
+        
+        # 检查直播源
+        if not args.no_check:
+            checker = IPTVSourceChecker(config)
+            check_results = checker.check(all_channels)
+            
+            # 保存结果为JSON文件（仅用于调试或API访问）
+            json_output_path = os.path.join(output_dir, "collected_sources.json")
+            
+            # 转换结果为可序列化的格式
+            serializable_results = {}
+            for channel_id, result in check_results.items():
+                serializable_results[channel_id] = {
+                    "info": result["info"],
+                    "sources": [
+                        {"url": url, "valid": valid, "latency": latency if latency != float('inf') else -1}
+                        for url, valid, latency in result["sources"]
+                    ]
+                }
+            
+            with open(json_output_path, 'w', encoding='utf-8') as f:
+                json.dump(serializable_results, f, ensure_ascii=False, indent=2)
+                
+            logger.info(f"JSON格式检测结果已保存到: {json_output_path}")
+            
+            # 下载和解析EPG数据
+            epg_data = {}
+            if not args.no_epg:
+                epg_data = download_and_parse_epg(config)
+                
+                # 匹配频道与EPG
+                serializable_results = match_channels_with_epg(serializable_results, epg_data, config)
+            
+            # 整理频道
+            channels_by_name = organize_channels(serializable_results, config)
+            
+            # 按分类排序频道
+            sorted_channels = sort_channels_by_category(channels_by_name, config)
+            
+            # 生成最终M3U文件
+            output_file = config.get("output_file", "iptv_collection.m3u")
+            output_path = os.path.join(output_dir, output_file)
+            generate_m3u(sorted_channels, output_path)
+        else:
+            logger.info("跳过直播源检测步骤")
+        
+        end_time = time.time()
+        logger.info(f"IPTV直播源处理完成，总耗时: {end_time - start_time:.2f}秒")
+        
+    except Exception as e:
+        logger.error(f"程序运行出错: {str(e)}", exc_info=True)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
