@@ -20,15 +20,28 @@ class IPTVSourceChecker:
         """检查所有频道的所有源的有效性"""
         logger.info(f"开始检查 {len(channels)} 个频道的直播源...")
         
-        # 准备检查任务
+        # 加载无效源缓存
+        cache_path = os.path.join(os.path.dirname(__file__), "data", "invalid_sources_cache.json")
+        invalid_sources = []
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r', encoding='utf-8') as f:
+                    invalid_sources = json.load(f)
+                logger.info(f"检查时加载了 {len(invalid_sources)} 个无效源缓存")
+            except Exception as e:
+                logger.warning(f"加载无效源缓存失败: {str(e)}")
+        
+        # 准备检查任务，跳过缓存中的无效源
         check_tasks = []
         for channel_id, (info, urls) in channels.items():
-            # 去重URL
+            # 去重URL并过滤缓存中的无效源
             unique_urls = list(set(urls))
-            for url in unique_urls:
+            filtered_urls = [url for url in unique_urls if url not in invalid_sources]
+            
+            for url in filtered_urls:
                 check_tasks.append((channel_id, info, url))
         
-        logger.info(f"共 {len(check_tasks)} 个直播源需要检查")
+        logger.info(f"共 {len(check_tasks)} 个直播源需要检查（已过滤缓存的无效源）")
         
         # 使用线程池并发检查
         with ThreadPoolExecutor(max_workers=self.config["max_workers"]) as executor:
