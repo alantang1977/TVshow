@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
 import sys
 import json
@@ -31,7 +28,6 @@ logger = logging.getLogger("IPTV-Main")
 def load_config():
     """加载配置文件"""
     config_path = os.path.join(os.path.dirname(__file__), "config.json")
-    
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
@@ -44,7 +40,6 @@ def load_config():
 def parse_m3u_file(filepath):
     """解析M3U文件，提取频道信息和URL"""
     logger.info(f"解析M3U文件: {filepath}")
-    
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
@@ -53,7 +48,6 @@ def parse_m3u_file(filepath):
         return {}
     
     channels = {}
-    
     lines = content.strip().split('\n')
     if not lines or not lines[0].startswith('#EXTM3U'):
         logger.warning(f"不是有效的M3U文件: {filepath}")
@@ -62,20 +56,14 @@ def parse_m3u_file(filepath):
     i = 1
     while i < len(lines):
         line = lines[i].strip()
-        
-        # 处理EXTINF行
         if line.startswith('#EXTINF'):
             extinf_line = line
             info = parse_extinf(extinf_line)
-            
-            # 获取频道ID
             channel_id = info.get('tvg-id') or info.get('tvg-name') or info.get('title')
-            
             if not channel_id:
                 i += 1
                 continue
             
-            # 查找URL行
             url = None
             j = i + 1
             while j < len(lines):
@@ -86,12 +74,10 @@ def parse_m3u_file(filepath):
                 j += 1
             
             if url:
-                # 将频道添加到集合中
                 if channel_id in channels:
                     channels[channel_id][1].append(url)
                 else:
                     channels[channel_id] = [info, [url]]
-                
                 i = j + 1
             else:
                 i += 1
@@ -104,114 +90,61 @@ def parse_m3u_file(filepath):
 def parse_extinf(extinf_line):
     """解析EXTINF行，提取频道信息"""
     info = {}
-    
     try:
-        # 提取时长和标题
         parts = extinf_line.split(',', 1)
         if len(parts) > 1:
             info['title'] = parts[1].strip()
         
-        # 提取属性
         attrs_part = parts[0]
         pattern = r'(\w+[-\w]*)\s*=\s*"([^"]*)"'
         matches = re.findall(pattern, attrs_part)
-        
         for key, value in matches:
             info[key] = value
-            
     except Exception as e:
         logger.error(f"解析EXTINF失败: {str(e)}")
-        
     return info
 
 def download_and_parse_epg(config):
-    """下载并解析EPG数据"""
+    """下载并解析EPG数据（补充频道图标和信息）"""
     if "epg_urls" not in config or not config["epg_urls"]:
         logger.info("未配置EPG URL，跳过EPG处理")
         return {}
         
     logger.info("开始下载和解析EPG数据")
-    
-    epg_data = {}  # 格式: {频道ID: {"id": id, "name": name, "icon": icon_url}}
-    
-    # EPG下载专用请求头
+    epg_data = {}  # {频道ID: {"id": id, "name": name, "icon": icon_url}}
     epg_headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
-        "Accept": "application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Referer": "https://github.com/",
+        "Accept": "application/xml,application/xhtml+xml,text/html;q=0.9,text/plain;q=0.8,image/png,*/*;q=0.5"
     }
     
     for epg_url in config["epg_urls"]:
         logger.info(f"下载EPG: {epg_url}")
         try:
-            # 随机延迟
             time.sleep(random.uniform(1, 3))
+            response = requests.get(epg_url, headers=epg_headers, timeout=120, allow_redirects=True)
             
-            response = requests.get(
-                epg_url, 
-                headers=epg_headers,
-                timeout=120,
-                allow_redirects=True
-            )
-            
-            if response.status_code == 403:
-                logger.warning(f"EPG访问被拒绝，尝试备用请求头: {epg_url}")
-                epg_headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15"
-                time.sleep(random.uniform(2, 4))
-                response = requests.get(epg_url, headers=epg_headers, timeout=120)
-                
             if response.status_code != 200:
                 logger.error(f"下载EPG失败，状态码: {response.status_code}")
                 continue
                 
-            # 检查是否为gzip格式
-            if epg_url.endswith('.gz'):
-                try:
-                    content = gzip.decompress(response.content)
-                except Exception as e:
-                    logger.error(f"解压EPG数据失败: {str(e)}")
+            content = gzip.decompress(response.content) if epg_url.endswith('.gz') else response.content
+            root = ET.fromstring(content)
+            
+            for channel in root.findall(".//channel"):
+                channel_id = channel.get('id')
+                if not channel_id:
                     continue
-            else:
-                content = response.content
+                display_name = channel.find('.//display-name')
+                name = display_name.text if display_name is not None else ""
+                icon = channel.find('.//icon')
+                icon_url = icon.get('src') if icon is not None else ""
                 
-            # 解析XML
-            try:
-                root = ET.fromstring(content)
-                
-                # 查找频道信息
-                for channel in root.findall(".//channel"):
-                    channel_id = channel.get('id')
-                    if not channel_id:
-                        continue
-                        
-                    # 获取频道名称
-                    display_name = channel.find('.//display-name')
-                    name = display_name.text if display_name is not None else ""
+                if channel_id not in epg_data:
+                    epg_data[channel_id] = {"id": channel_id, "name": name, "icon": icon_url}
+                elif not epg_data[channel_id]["icon"] and icon_url:
+                    epg_data[channel_id]["icon"] = icon_url
                     
-                    # 获取频道图标
-                    icon = channel.find('.//icon')
-                    icon_url = icon.get('src') if icon is not None else ""
-                    
-                    # 存储频道信息
-                    if channel_id not in epg_data:
-                        epg_data[channel_id] = {
-                            "id": channel_id,
-                            "name": name,
-                            "icon": icon_url
-                        }
-                    elif not epg_data[channel_id]["icon"] and icon_url:
-                        # 如果当前EPG数据没有图标但新数据有，则更新
-                        epg_data[channel_id]["icon"] = icon_url
-                        
-                logger.info(f"从 {epg_url} 解析出 {len(root.findall('.//channel'))} 个频道信息")
-                    
-            except ET.ParseError as e:
-                logger.error(f"解析EPG XML数据失败: {str(e)}")
-                continue
-                
+            logger.info(f"从 {epg_url} 解析出 {len(root.findall('.//channel'))} 个频道信息")
         except Exception as e:
             logger.error(f"处理EPG出错: {str(e)}")
             continue
@@ -219,80 +152,78 @@ def download_and_parse_epg(config):
     logger.info(f"EPG数据解析完成，共收集 {len(epg_data)} 个频道信息")
     return epg_data
 
+def categorize_channel(name, config):
+    """细化频道分类（新增港澳台细分逻辑）"""
+    hk_keywords = ['TVB', '翡翠台', 'ViuTV', 'RTHK', '凤凰', '华丽']
+    mo_keywords = ['澳视', '澳门', '莲花']
+    tw_keywords = ['台视', '中视', '华视', '中天', '纬来', 'TVBS']
+    
+    if any(kw in name for kw in hk_keywords):
+        return '港澳台频道/香港'
+    elif any(kw in name for kw in mo_keywords):
+        return '港澳台频道/澳门'
+    elif any(kw in name for kw in tw_keywords):
+        return '港澳台频道/台湾'
+    elif re.match(r'^CCTV-\d+', name):
+        return '央视频道'
+    elif re.match(r'^(北京|江苏|浙江|湖南|东方)卫视', name):
+        return '卫视频道'
+    else:
+        return '地方频道'  # 可扩展其他分类
+
 def match_channels_with_epg(sources_data, epg_data, config):
-    """将频道与EPG数据匹配"""
+    """将频道与EPG数据匹配（补充属性信息）"""
     if not epg_data:
         return sources_data
         
     logger.info("开始匹配频道与EPG数据")
-    
-    # 简化频道名称的函数，用于匹配
     def simplify_name(name):
         if not name:
             return ""
-        # 移除空格和特殊字符
         simplified = re.sub(r'[^\w\u4e00-\u9fff]', '', name.lower())
-        # 常见频道名称替换
-        replacements = {
-            'cctv': 'cctv',
-            'central': 'cctv',
-            'china': 'cctv',
-            'hong': 'hk',
-            'tai': 'tw',
-            'television': 'tv',
-            'channel': ''
-        }
+        replacements = {'cctv': 'cctv', 'hong': 'hk', 'tai': 'tw', 'television': 'tv'}
         for old, new in replacements.items():
             simplified = simplified.replace(old, new)
         return simplified
     
-    # 创建EPG索引，用于快速查找
     epg_index = {}
     for epg_id, data in epg_data.items():
         simple_name = simplify_name(data["name"])
         if simple_name:
             epg_index[simple_name] = epg_id
     
-    # 匹配频道
     matched_count = 0
     for channel_id, data in sources_data.items():
         info = data["info"]
         title = info.get('title', '')
-        
-        # 规范化频道名称
         normalized_title = normalize_channel_name(title, config)
         if normalized_title != title:
             info['title'] = normalized_title
-            
-        # 尝试直接匹配EPG ID
+        
+        # 补充分类信息
+        info['group-title'] = categorize_channel(normalized_title, config)
+        
+        # 补充自定义属性（语言、类型等）
+        if normalized_title in config.get("channel_attributes", {}):
+            attrs = config["channel_attributes"][normalized_title]
+            info.update(attrs)
+        
+        # EPG匹配逻辑
         if channel_id in epg_data:
-            # 更新tvg-id和tvg-logo
             info['tvg-id'] = epg_data[channel_id]["id"]
             if not info.get('tvg-logo') and epg_data[channel_id]["icon"]:
                 info['tvg-logo'] = epg_data[channel_id]["icon"]
             matched_count += 1
             continue
-            
-        # 尝试通过简化名称匹配
+        
         simple_title = simplify_name(normalized_title)
         if simple_title in epg_index:
             epg_id = epg_index[simple_title]
-            # 更新tvg-id和tvg-logo
             info['tvg-id'] = epg_data[epg_id]["id"]
             if not info.get('tvg-logo') and epg_data[epg_id]["icon"]:
                 info['tvg-logo'] = epg_data[epg_id]["icon"]
             matched_count += 1
             continue
-            
-        # 尝试模糊匹配
-        for epg_name, epg_id in epg_index.items():
-            if (epg_name in simple_title) or (simple_title in epg_name and len(simple_title) > 3):
-                # 更新tvg-id和tvg-logo
-                info['tvg-id'] = epg_data[epg_id]["id"]
-                if not info.get('tvg-logo') and epg_data[epg_id]["icon"]:
-                    info['tvg-logo'] = epg_data[epg_id]["icon"]
-                matched_count += 1
-                break
     
     logger.info(f"频道与EPG匹配完成，成功匹配 {matched_count} 个频道")
     return sources_data
@@ -301,77 +232,53 @@ def normalize_channel_name(name, config):
     """规范化频道名称"""
     if not name:
         return name
-        
     name_lower = name.lower()
-    
-    # 尝试匹配映射表
     if "channel_name_map" in config:
         for pattern, normalized_name in config["channel_name_map"].items():
             if re.search(pattern, name_lower):
                 return normalized_name
-                
     return name
 
 def should_exclude_channel(info, url, config):
-    """检查是否应该排除某个频道或源"""
-    # 检查URL是否包含被排除的源
+    """检查是否排除频道或源"""
     if "excluded_sources" in config:
         for excluded_source in config["excluded_sources"]:
             if excluded_source in url:
                 return True
     
-    # 检查频道ID是否为数字
-    # 有些源使用纯数字作为频道ID，可能会导致乱码或其他问题
     tvg_id = info.get('tvg-id', '')
-    if tvg_id and tvg_id.isdigit() and len(tvg_id) < 5:  # 排除类似"4"这样的频道ID
-        return True
-        
-    # 检查组标题是否包含乱码
-    group_title = info.get('group-title', '')
-    if any(char in group_title for char in ['å', 'é¢', 'è§', 'é', '¢', '§', 'è', 'æ', 'ç', '¾', 'â']):
+    if tvg_id and tvg_id.isdigit() and len(tvg_id) < 5:
         return True
     
+    group_title = info.get('group-title', '')
+    if any(char in group_title for char in ['å', 'é¢', 'è§']):
+        return True
     return False
 
 def organize_channels(sources_data, config):
-    """整理频道，去除重复，为每个频道保留最多两个源"""
+    """整理频道，保留最优源"""
     logger.info("开始整理频道...")
-    
-    # 按频道名称分组
     channels_by_name = {}
     
-    # 整理频道
     for channel_id, data in sources_data.items():
         info = data["info"]
         title = info.get('title', '')
-        
-        # 跳过没有标题的频道
         if not title:
             continue
             
-        # 收集有效源，并排除不需要的源
         valid_sources = []
         for source in data["sources"]:
             if source["valid"] and not should_exclude_channel(info, source["url"], config):
                 valid_sources.append((source["url"], source["latency"]))
         
-        # 如果没有有效源，跳过此频道
         if not valid_sources:
             continue
             
-        # 按延迟排序
         valid_sources.sort(key=lambda x: x[1])
-        
-        # 保留最多两个源（速度最快和第二快的）
         best_sources = valid_sources[:min(2, len(valid_sources))]
         
-        # 将频道添加到按名称分组的集合中
         if title in channels_by_name:
-            existing_sources = channels_by_name[title]["sources"]
-            existing_latency = channels_by_name[title]["latency"]
-            
-            # 如果现有的延迟更高（更慢），则替换为新的源
-            if best_sources[0][1] < existing_latency:
+            if best_sources[0][1] < channels_by_name[title]["latency"]:
                 channels_by_name[title] = {
                     "info": info,
                     "sources": [source[0] for source in best_sources],
@@ -388,103 +295,46 @@ def organize_channels(sources_data, config):
     return channels_by_name
 
 def sort_channels_by_category(channels, config):
-    """按分类对频道进行排序，仅对央视频道按数字从小到大排序，其他分类保持原有顺序"""
-    # 定义分类顺序
+    """按分类排序（支持多级分类）"""
     category_order = {cat: idx for idx, cat in enumerate(config.get("categories", []))}
     default_order = len(category_order)
     
-    # 分离央视和其他频道
-    cctv_channels = []
-    other_channels = []
-    
-    for channel_name, data in channels.items():
-        # 检查是否为央视频道
-        if re.match(r'^CCTV-\d+', channel_name):
-            # 提取频道数字
-            match = re.search(r'CCTV-(\d+)', channel_name)
-            if match:
-                cctv_num = int(match.group(1))
-                cctv_channels.append((channel_name, data, cctv_num))
-            else:
-                other_channels.append((channel_name, data))
-        else:
-            other_channels.append((channel_name, data))
-    
-    # 央视频道按数字从小到大排序
-    cctv_channels.sort(key=lambda x: x[2])
-    # 转换回原格式
-    sorted_cctv = [(name, data) for name, data, num in cctv_channels]
-    
-    # 其他频道按分类分组后保持原有顺序
-    categorized_others = {}
-    for name, data in other_channels:
+    # 按分类分组
+    categorized = {}
+    for name, data in channels.items():
         group = data["info"].get("group-title", "其他")
-        if group not in categorized_others:
-            categorized_others[group] = []
-        categorized_others[group].append((name, data))
+        if group not in categorized:
+            categorized[group] = []
+        categorized[group].append((name, data))
     
-    # 按分类顺序组织其他频道
-    sorted_others = []
-    # 获取所有分类并按配置顺序排序
-    all_groups = set(categorized_others.keys())
-    # 按配置中的分类顺序处理
-    for cat in config.get("categories", []):
-        if cat in categorized_others:
-            sorted_others.extend(categorized_others[cat])
-            all_groups.remove(cat)
-    # 处理剩余分类
-    for group in all_groups:
-        sorted_others.extend(categorized_others[group])
+    # 按配置顺序排序分类
+    sorted_groups = sorted(categorized.keys(), key=lambda x: category_order.get(x, default_order))
     
-    # 合并央视和其他频道
-    # 先按分类顺序处理，当遇到央视分类时插入排序好的央视，其他分类插入对应频道
+    # 组内排序（央视按数字，其他按名称）
     final_sorted = []
-    cctv_group = "央视"  # 假设央视分类名为"央视"
-    cctv_added = False
-    
-    # 获取所有分类并按配置顺序排序
-    all_categories = []
-    for cat in config.get("categories", []):
-        if cat in categorized_others or (cat == cctv_group and cctv_channels):
-            all_categories.append(cat)
-    # 添加剩余分类
-    for group in all_groups:
-        if group not in all_categories:
-            all_categories.append(group)
-    
-    # 按分类顺序构建最终列表
-    for cat in all_categories:
-        if cat == cctv_group and not cctv_added:
-            # 添加排序好的央视频道
-            final_sorted.extend(sorted_cctv)
-            cctv_added = True
-        elif cat in categorized_others:
-            # 添加该分类下的其他频道
-            final_sorted.extend(categorized_others[cat])
+    for group in sorted_groups:
+        group_channels = categorized[group]
+        if group == "央视频道":
+            # 央视频道按数字排序
+            group_channels.sort(key=lambda x: int(re.search(r'CCTV-(\d+)', x[0]).group(1)) if re.search(r'CCTV-(\d+)', x[0]) else 0)
+        else:
+            # 其他按名称拼音排序
+            group_channels.sort(key=lambda x: x[0])
+        final_sorted.extend(group_channels)
     
     return final_sorted
 
 def generate_m3u(sorted_channels, output_path):
-    """生成M3U文件，包含主源和备用源"""
+    """生成带分类和多源的M3U文件"""
     logger.info(f"开始生成M3U文件: {output_path}")
-    
     with open(output_path, 'w', encoding='utf-8') as f:
-        # 写入头部
         f.write("#EXTM3U\n")
-        
-        # 写入频道信息
         for channel_name, data in sorted_channels:
             info = data["info"]
             sources = data["sources"]
-            
-            # 构建EXTINF行
             extinf = build_extinf(info)
             f.write(f"{extinf}\n")
-            
-            # 写入主源
             f.write(f"{sources[0]}\n")
-            
-            # 如果有备用源，添加备用源标记和URL
             if len(sources) > 1:
                 f.write(f"#EXTBURL:{sources[1]}\n")
     
@@ -492,57 +342,48 @@ def generate_m3u(sorted_channels, output_path):
     return output_path
 
 def generate_txt(sorted_channels, output_path):
-    """生成标准TXT格式直播源文件，格式为"频道名称,主源URL,备用源URL(可选)" """
+    """生成带分类注释的TXT文件"""
     logger.info(f"开始生成TXT文件: {output_path}")
-    
     with open(output_path, 'w', encoding='utf-8') as f:
-        # 写入说明行
         f.write("# 标准IPTV直播源TXT格式：频道名称,主源URL,备用源URL(可选)\n")
-        
-        # 写入频道信息
+        current_group = None
         for channel_name, data in sorted_channels:
+            group = data["info"].get("group-title", "其他")
+            if group != current_group:
+                f.write(f"\n# {group}\n")
+                current_group = group
             sources = data["sources"]
-            # 构建TXT行，使用逗号分隔
             line_parts = [channel_name, sources[0]]
-            # 添加备用源（如果有）
             if len(sources) > 1:
                 line_parts.append(sources[1])
-            # 写入行
             f.write(f"{','.join(line_parts)}\n")
     
     logger.info(f"TXT文件生成完成: {output_path}, 共 {len(sorted_channels)} 个频道")
     return output_path
 
 def build_extinf(info):
-    """构建EXTINF行"""
+    """构建包含分类和属性的EXTINF行"""
     attrs = []
-    
     for key, value in info.items():
         if key != 'title':
             attrs.append(f'{key}="{value}"')
-    
     attrs_str = ' '.join(attrs)
     title = info.get('title', '')
-    
     return f"#EXTINF:-1 {attrs_str},{title}"
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='IPTV直播源收集、检测与整理工具')
-    parser.add_argument('--no-check', action='store_true', help='跳过直播源检测步骤')
+    parser = argparse.ArgumentParser(description='IPTV直播源处理工具')
+    parser.add_argument('--no-check', action='store_true', help='跳过直播源检测')
     parser.add_argument('--no-epg', action='store_true', help='跳过EPG处理')
-    parser.add_argument('--max-channels', type=int, default=0, help='最大处理频道数量(用于测试)')
+    parser.add_argument('--max-channels', type=int, default=0, help='最大处理频道数(测试用)')
     args = parser.parse_args()
     
     start_time = time.time()
     logger.info("开始IPTV直播源处理流程")
     
     try:
-        # 加载配置
         config = load_config()
-        logger.info(f"配置加载完成，共 {len(config['sources'])} 个直播源")
-        
-        # 创建输出目录
         output_dir = os.path.join(os.path.dirname(__file__), config["output_dir"])
         os.makedirs(output_dir, exist_ok=True)
         
@@ -555,79 +396,50 @@ def main():
         all_channels = {}
         for filepath in source_files:
             channels = parse_m3u_file(filepath)
-            
-            # 合并到全局频道集合
             for channel_id, (info, urls) in channels.items():
                 if channel_id in all_channels:
                     all_channels[channel_id][1].extend(urls)
                 else:
                     all_channels[channel_id] = [info, urls]
-                    
-            # 如果设置了最大频道数限制，用于测试
-            if args.max_channels > 0 and len(all_channels) >= args.max_channels:
-                logger.info(f"达到最大频道数限制 ({args.max_channels})，停止收集")
-                break
         
-        # 去重URL
+        # 转换为检测格式
+        sources_data = {}
         for channel_id, (info, urls) in all_channels.items():
-            all_channels[channel_id][1] = list(set(urls))
+            sources_data[channel_id] = {
+                "info": info,
+                "urls": list(set(urls))  # 去重URL
+            }
         
-        logger.info(f"共解析出 {len(all_channels)} 个频道, {sum(len(urls) for _, urls in all_channels.values())} 个直播源")
-        
-        # 检查直播源
+        # 检测直播源有效性
         if not args.no_check:
             checker = IPTVSourceChecker(config)
-            check_results = checker.check(all_channels)
-            
-            # 转换结果格式
-            processed_results = {}
-            for channel_id, data in check_results.items():
-                processed_results[channel_id] = {
-                    "info": data["info"],
-                    "sources": [{"url": url, "valid": valid, "latency": latency} 
-                               for url, valid, latency in data["sources"]]
-                }
+            sources_data = checker.check(sources_data)
         else:
-            # 跳过检查时，默认所有源都有效
-            processed_results = {}
-            for channel_id, (info, urls) in all_channels.items():
-                processed_results[channel_id] = {
-                    "info": info,
-                    "sources": [{"url": url, "valid": True, "latency": 0} for url in urls]
-                }
+            for channel_id in sources_data:
+                sources_data[channel_id]["sources"] = [
+                    {"url": url, "valid": True, "latency": 0} for url in sources_data[channel_id]["urls"]
+                ]
         
-        # 处理EPG数据
-        epg_data = {}
-        if not args.no_epg:
-            epg_data = download_and_parse_epg(config)
-        
-        # 匹配频道与EPG
-        matched_channels = match_channels_with_epg(processed_results, epg_data, config)
+        # 处理EPG
+        epg_data = {} if args.no_epg else download_and_parse_epg(config)
+        sources_data = match_channels_with_epg(sources_data, epg_data, config)
         
         # 整理频道
-        organized_channels = organize_channels(matched_channels, config)
+        organized_channels = organize_channels(sources_data, config)
         
         # 按分类排序
         sorted_channels = sort_channels_by_category(organized_channels, config)
         
         # 生成输出文件
-        output_file = config["output_file"]
-        output_path = os.path.join(output_dir, output_file)
+        m3u_path = os.path.join(output_dir, "iptv_collection.m3u")
+        txt_path = os.path.join(output_dir, "iptv_collection.txt")
+        generate_m3u(sorted_channels, m3u_path)
+        generate_txt(sorted_channels, txt_path)
         
-        # 生成M3U文件
-        generate_m3u(sorted_channels, output_path)
-        
-        # 生成TXT文件
-        txt_output_path = os.path.splitext(output_path)[0] + ".txt"
-        generate_txt(sorted_channels, txt_output_path)
-        
-        # 计算总耗时
-        end_time = time.time()
-        total_time = end_time - start_time
-        logger.info(f"IPTV直播源处理流程完成，总耗时: {total_time:.2f}秒")
+        logger.info(f"所有处理完成，耗时 {time.time() - start_time:.2f} 秒")
         
     except Exception as e:
-        logger.error(f"处理过程中发生错误: {str(e)}", exc_info=True)
+        logger.error(f"处理过程出错: {str(e)}", exc_info=True)
         sys.exit(1)
 
 if __name__ == "__main__":
